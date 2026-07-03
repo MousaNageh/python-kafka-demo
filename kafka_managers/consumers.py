@@ -1,10 +1,10 @@
-import threading
 from typing import Type
 
 from kafka import KafkaConsumer
 from kafka.serializer import DefaultSerializer
 
-from main_functions.consumer_handler import ConsumerHandler
+from kafka_managers.consumer_handler import ConsumerHandler
+
 
 BOOTSTRAP_SERVERS = "localhost:9092"
 

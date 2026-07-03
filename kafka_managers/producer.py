@@ -1,7 +1,18 @@
+from functools import partial
+
 from kafka import KafkaProducer
+from kafka.errors import KafkaError, KafkaTimeoutError
 from kafka.serializer import DefaultSerializer
 
 BOOTSTRAP_SERVERS = "localhost:9092"
+
+
+# Dead-letter list: records that FAILED permanently (retries exhausted or a
+# non-retriable error) are collected here so the caller can inspect or reprocess
+# them instead of losing them to a print. Each entry is (topic, key, value,
+# exception). In-memory only -> a real system would push these to a DLQ topic or
+# a database; this is enough to see and recover failures in the course project.
+dead_letters = []
 
 
 # Callbacks run asynchronously on the producer's internal I/O thread once the
@@ -15,9 +26,14 @@ def on_success(metadata):
     )
 
 
-def on_error(exc):
-    # called when the send ultimately fails
-    print(f"Send failed: {exc}")
+# The errback natively receives ONLY the exception, so it cannot tell which
+# record failed. We bind the record via functools.partial in produce() ->
+# partial(on_error, topic, key, value) leaves `exc` as the last arg the client
+# fills in when the send fails.
+def on_error(topic, key, value, exc):
+    # called when the send ultimately fails (retries exhausted or non-retriable).
+    print(f"Send failed -> topic: {topic}  key: {key}  error: {exc}")
+    dead_letters.append((topic, key, value, exc))
 
 
 # One shared producer for the whole process. Idempotence guarantees (dedup of
@@ -43,6 +59,34 @@ def get_producer():
             bootstrap_servers=BOOTSTRAP_SERVERS,
             acks="all",
             enable_idempotence=True,
+            # compression_type: the producer compresses each BATCH of records
+            # before sending. The codec is written into the batch header, so the
+            # broker stores it compressed and the CONSUMER decompresses it
+            # automatically -> no manual decompression on the consumer side.
+            # "zstd" gives ~gzip compression ratio at much higher speed; it needs
+            # the `zstandard` package installed on BOTH producer and consumer,
+            # and brokers >= 2.1. Our wikimedia JSON is very repetitive so it
+            # compresses a lot. Bigger batches (linger_ms / batch_size) compress
+            # better.
+            compression_type="zstd",
+            # linger_ms: how long the producer waits for MORE records to join a
+            # batch before sending it, even if the batch is not full. The default
+            # is 0 -> a batch is sent the instant the I/O thread is free, so under
+            # low load we often ship batches of 1. Waiting ~20ms lets records
+            # accumulate into fuller batches, which improves throughput and (with
+            # zstd above) compression, at the cost of a little latency. Great
+            # trade for a high-volume, very repetitive feed like wikimedia.
+            linger_ms=20,
+            # batch_size: the MAX size (in bytes) of a single batch, PER
+            # partition. Once accumulated records for a partition reach this many
+            # bytes the batch is sent immediately. Default is 16384 (16 KB); we
+            # double it to 32 KB so batches hold more records -> better
+            # compression and fewer requests, using a bit more memory per
+            # partition. It is a cap, not a target: a batch can still be sent
+            # early when linger_ms elapses. A record larger than batch_size is not
+            # batched at all. A batch flushes when EITHER limit is hit first:
+            # batch_size bytes reached OR linger_ms elapsed.
+            batch_size=32 * 1024,
             # DefaultSerializer: str -> utf-8 bytes (bytes/None pass through). It
             # is a proper kafka.serializer.Serializer, unlike the deprecated
             # lambda form.
@@ -73,11 +117,27 @@ def produce(topic_name, key, value):
     send() is async and buffered -> it does NOT block or flush here. Call
     flush_producer() to force delivery and close_producer() on shutdown.
     """
-    # register callbacks that fire later, on the producer's I/O thread, when the
-    # broker responds (or the send ultimately fails).
-    get_producer().send(topic_name, key=key, value=value) \
-        .add_callback(on_success) \
-        .add_errback(on_error)
+    # send() is async, but it can still raise SYNCHRONOUSLY on THIS thread before
+    # any future exists -> e.g. KafkaTimeoutError when the buffer_memory is full
+    # and max_block_ms elapsed (producing faster than the broker drains), a
+    # serialization error, or the producer being already closed. Wrap it so a
+    # producer-side failure is captured as a dead letter instead of crashing the
+    # caller.
+    try:
+        # register callbacks that fire later, on the producer's I/O thread, when
+        # the broker responds (or the send ultimately fails). on_error is bound
+        # to this record via partial so the errback knows WHICH message failed.
+        get_producer().send(topic_name, key=key, value=value) \
+            .add_callback(on_success) \
+            .add_errback(partial(on_error, topic_name, key, value))
+    except KafkaTimeoutError as exc:
+        # buffer full -> back-pressure signal. Don't drop silently; record it.
+        print(f"Buffer full, send blocked -> key: {key}  error: {exc}")
+        dead_letters.append((topic_name, key, value, exc))
+    except KafkaError as exc:
+        # serialization error, producer closed, etc. -> caller's thread.
+        print(f"send() failed synchronously -> key: {key}  error: {exc}")
+        dead_letters.append((topic_name, key, value, exc))
 
 
 def flush_producer():
