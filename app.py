@@ -1,5 +1,5 @@
 import requests
-from kafka_managers.producer import produce
+from kafka_managers.producer import produce, close_producer
 from kafka_managers.topic_manager import create_topic
 from topics import WIKIMEDIA_RECENT_TOPIC
 import json
@@ -15,6 +15,8 @@ for line in res.iter_lines():
         line = line.decode("utf-8").strip(" data:  ")
         try:
             data = json.loads(line)
-            produce(topic_name=WIKIMEDIA_RECENT_TOPIC, key=None, value=json.dumps(data), acks=0)
+            produce(topic_name=WIKIMEDIA_RECENT_TOPIC, key=None, value=json.dumps(data))
         except json.JSONDecodeError:
             pass 
+
+close_producer()

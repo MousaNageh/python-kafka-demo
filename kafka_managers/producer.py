@@ -49,6 +49,14 @@ def get_producer():
             key_serializer=DefaultSerializer(),
             value_serializer=DefaultSerializer(),
         )
+
+        # KafkaProducer merges our overrides with all its defaults into
+        # _producer.config -> print the full resolved config so we can see the
+        # effective values (acks, retries, max_in_flight_requests_per_connection,
+        # enable_idempotence, ...) the client actually chose.
+        print("Producer config:")
+        for name, value in _producer.config.items():
+            print(f"  {name} = {value}")
     return _producer
 
 
