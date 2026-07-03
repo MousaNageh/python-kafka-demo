@@ -1,0 +1,10 @@
+#!/bin/sh
+'''exec' "/home/mousa/Desktop/courses/microservices/Udemy - Apache Kafka Series - Learn Apache Kafka for Beginners v3/my_code/venv/bin/python3" "$0" "$@"
+' '''
+# -*- coding: utf-8 -*-
+import re
+import sys
+from kafka.cli import run_cli
+if __name__ == '__main__':
+    sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
+    sys.exit(run_cli())
