@@ -20,37 +20,71 @@ def on_error(exc):
     print(f"Send failed: {exc}")
 
 
-def produce(topic_name, key, value, acks="all"):
-    """Send one record to topic_name.
+# One shared producer for the whole process. Idempotence guarantees (dedup of
+# retries + ordering) are scoped to a single producer session, so the producer
+# MUST be long-lived and reused across messages -> recreating it per message
+# would restart the producer id/sequence and throw those guarantees away. It is
+# also expensive (new connections + metadata fetch) to build one per record.
+_producer = None
+
+
+def get_producer():
+    """Return the process-wide idempotent producer, creating it on first use."""
+    global _producer
+    if _producer is None:
+        # enable_idempotence=True makes the producer exactly-once *per
+        # partition*: the broker de-duplicates retried records (via a producer
+        # id + sequence number), so a retry after a flaky ack never writes a
+        # duplicate and order is preserved. It REQUIRES acks="all", retries > 0,
+        # and max_in_flight_requests_per_connection <= 5 -> the kafka-python
+        # client sets those safe defaults for us, but we force acks="all" so
+        # idempotence is not silently disabled.
+        _producer = KafkaProducer(
+            bootstrap_servers=BOOTSTRAP_SERVERS,
+            acks="all",
+            enable_idempotence=True,
+            # DefaultSerializer: str -> utf-8 bytes (bytes/None pass through). It
+            # is a proper kafka.serializer.Serializer, unlike the deprecated
+            # lambda form.
+            key_serializer=DefaultSerializer(),
+            value_serializer=DefaultSerializer(),
+        )
+    return _producer
+
+
+def produce(topic_name, key, value):
+    """Queue one record for topic_name on the shared idempotent producer.
 
     key   : message key (str or None) -> decides the partition
     value : message value (str)
-    acks  : 0    -> fire and forget (no broker acknowledgement)
-            1    -> wait for the leader to write the record
-            "all"-> wait for the leader + all in-sync replicas (safest).
-                    Only with acks="all" does the topic's min.insync.replicas
-                    (set in create_topic) apply: the write is rejected unless
-                    at least that many replicas have the record.
-    """
-    producer = KafkaProducer(
-        bootstrap_servers=BOOTSTRAP_SERVERS,
-        acks=acks,
-        # DefaultSerializer: str -> utf-8 bytes (bytes/None pass through). It is a
-        # proper kafka.serializer.Serializer, unlike the deprecated lambda form.
-        key_serializer=DefaultSerializer(),
-        value_serializer=DefaultSerializer(),
-    )
 
-    # send() is async and returns a future; instead of blocking with .get(),
-    # register callbacks that fire later when the broker responds.
-    producer.send(topic_name, key=key, value=value) \
+    This producer is idempotent, which forces acks="all". With acks="all" the
+    topic's min.insync.replicas (set in create_topic) applies: the write is
+    rejected unless at least that many replicas have the record.
+
+    send() is async and buffered -> it does NOT block or flush here. Call
+    flush_producer() to force delivery and close_producer() on shutdown.
+    """
+    # register callbacks that fire later, on the producer's I/O thread, when the
+    # broker responds (or the send ultimately fails).
+    get_producer().send(topic_name, key=key, value=value) \
         .add_callback(on_success) \
         .add_errback(on_error)
 
-    # flush() forces buffered records to be delivered NOW; the callbacks above
-    # fire during this call before we close the producer.
-    producer.flush()
-    producer.close()
+
+def flush_producer():
+    """Block until all buffered records are delivered and callbacks have run."""
+    if _producer is not None:
+        _producer.flush()
+
+
+def close_producer():
+    """Flush and close the shared producer. Call once on process shutdown."""
+    global _producer
+    if _producer is not None:
+        _producer.flush()
+        _producer.close()
+        _producer = None
 
 
 
