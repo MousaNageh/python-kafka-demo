@@ -1,0 +1,1 @@
+WIKIMEDIA_RECENT_TOPIC='wikimedia.recentchange'
