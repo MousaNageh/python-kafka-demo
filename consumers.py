@@ -22,10 +22,30 @@ def run_consumer(group_id: str, consumer_name: str):
       consumed only AFTER we have fully processed the message (consumer.commit()).
       This is "at-least-once" delivery: if the consumer crashes after processing
       but before committing, the message is simply re-read on restart (never lost).
-    - auto_offset_reset="earliest" -> only used when the group has NO committed
-      offset yet (brand new group): start from the very first record.
-      Use "latest" to only receive messages produced AFTER the consumer starts.
 
+    -------------------------------------------------------------------
+    DELIVERY SEMANTICS (decided by WHEN you commit the offset)
+    -------------------------------------------------------------------
+    AT-MOST-ONCE  -> commit the offset BEFORE processing the message.
+        order: read -> commit offset -> process
+        A crash after commit but before processing LOSES the message.
+        No duplicates, but messages can be missed. (fast, least safe)
+        In kafka-python: enable_auto_commit=True (auto-commits early).
+
+    AT-LEAST-ONCE -> commit the offset AFTER processing the message.  <-- THIS CODE
+        order: read -> process -> commit offset
+        A crash after processing but before commit RE-READS the message,
+        so it may be processed twice. Never lost, but can be duplicated.
+        Make your processing idempotent to stay correct.
+
+    EXACTLY-ONCE  -> each message takes effect once, no loss, no duplicates.
+        Not achievable with plain offset commits. You need EITHER:
+          * Kafka transactions (read-process-write fully inside Kafka:
+            producer.init_transactions / send_offsets_to_transaction), OR
+          * an idempotent/transactional sink where the processing result and
+            the offset are written together atomically (e.g. same DB tx).
+        Strongest guarantee, most overhead.
+        
     Because offsets are tracked PER GROUP:
     - Consumers in the SAME group share the work: each partition is read by
       exactly one consumer in the group (load balancing).
