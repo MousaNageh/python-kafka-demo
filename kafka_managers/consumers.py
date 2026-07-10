@@ -23,7 +23,7 @@ MAX_RETRIES = 5
 # BULK_POLL_TIMEOUT_MS -> how long poll() waits to fill a batch before returning
 #   what it has, so a low-traffic stream still flushes promptly.
 BULK_MAX_RECORDS = 500
-BULK_POLL_TIMEOUT_MS = 1000
+BULK_POLL_TIMEOUT_MS = 5000
 
 
 def _bulk_error_is_transient(status: int) -> bool:

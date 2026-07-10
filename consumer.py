@@ -104,4 +104,4 @@ if __name__ == "__main__":
         # running their graceful shutdown; join again to let them finish.
         print("Shutting down consumers...")
         for p in procs:
-            p.join()
+            p.close()
