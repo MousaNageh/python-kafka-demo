@@ -7,12 +7,53 @@ from kafka.serializer import DefaultSerializer
 BOOTSTRAP_SERVERS = "localhost:9092"
 
 
-# Dead-letter list: records that FAILED permanently (retries exhausted or a
-# non-retriable error) are collected here so the caller can inspect or reprocess
-# them instead of losing them to a print. Each entry is (topic, key, value,
-# exception). In-memory only -> a real system would push these to a DLQ topic or
-# a database; this is enough to see and recover failures in the course project.
-dead_letters = []
+# Records that FAIL to be produced (retries exhausted, a non-retriable error, or
+# a synchronous send() failure) are re-routed to a DEAD-LETTER TOPIC instead of a
+# throwaway in-memory list -> they survive a process restart and can be inspected
+# or replayed later. The DLQ topic name is derived from the original topic:
+# "wikimedia.recentchange" -> "wikimedia.recentchange.dlq".
+DLQ_SUFFIX = ".dlq"
+
+
+def dlq_topic_for(topic_name: str) -> str:
+    """<topic> -> <topic>.dlq, the dead-letter topic failed records go to."""
+    return f"{topic_name}{DLQ_SUFFIX}"
+
+
+def _dlq_send_failed(dlq_topic, exc):
+    # last resort: the DLQ send ITSELF failed (e.g. the broker is down). Do NOT
+    # try to dead-letter it again -> that would loop forever. Just log and drop.
+    print(f"DLQ send to {dlq_topic} FAILED (dropping): {exc}")
+
+
+def send_to_dead_letter(origin_topic, key, value, exc, source):
+    """Route a failed record to <origin_topic>.dlq.
+
+    source : "producer" or "consumer" -> stamped into the dlq-source header so a
+             reader of the DLQ can tell WHICH side failed. We also add dlq-error
+             (the failure reason) and dlq-origin (the original topic).
+    """
+    # never dead-letter a record already headed for a DLQ -> if the broker is
+    # down the DLQ send fails too, and we would recurse endlessly.
+    if origin_topic.endswith(DLQ_SUFFIX):
+        print(f"Not re-dead-lettering a DLQ record ({origin_topic}): {exc}")
+        return
+    dlq_topic = dlq_topic_for(origin_topic)
+    headers = [
+        ("dlq-source", source.encode("utf-8")),
+        ("dlq-error", str(exc).encode("utf-8")),
+        ("dlq-origin", str(origin_topic).encode("utf-8")),
+    ]
+    try:
+        # send DIRECTLY (not via produce()) so a DLQ failure lands on the
+        # harmless _dlq_send_failed errback instead of re-entering the normal
+        # on_error dead-letter path and recursing.
+        get_producer().send(dlq_topic, key=key, value=value, headers=headers) \
+            .add_errback(partial(_dlq_send_failed, dlq_topic))
+    except KafkaError as dlq_exc:
+        # KafkaTimeoutError (buffer still full) is a KafkaError subclass, so a
+        # failed DLQ send here is caught and dropped rather than raised.
+        _dlq_send_failed(dlq_topic, dlq_exc)
 
 
 # Callbacks run asynchronously on the producer's internal I/O thread once the
@@ -33,7 +74,7 @@ def on_success(metadata):
 def on_error(topic, key, value, exc):
     # called when the send ultimately fails (retries exhausted or non-retriable).
     print(f"Send failed -> topic: {topic}  key: {key}  error: {exc}")
-    dead_letters.append((topic, key, value, exc))
+    send_to_dead_letter(topic, key, value, exc, source="producer")
 
 
 # One shared producer for the whole process. Idempotence guarantees (dedup of
@@ -104,11 +145,14 @@ def get_producer():
     return _producer
 
 
-def produce(topic_name, key, value):
+def produce(topic_name, key, value, headers=None):
     """Queue one record for topic_name on the shared idempotent producer.
 
-    key   : message key (str or None) -> decides the partition
-    value : message value (str)
+    key     : message key (str or None) -> decides the partition
+    value   : message value (str)
+    headers : optional list of (str, bytes) pairs -> record headers, carried
+              alongside the message (used e.g. to tag dead-lettered records with
+              the failure reason and their origin offset).
 
     This producer is idempotent, which forces acks="all". With acks="all" the
     topic's min.insync.replicas (set in create_topic) applies: the write is
@@ -127,17 +171,17 @@ def produce(topic_name, key, value):
         # register callbacks that fire later, on the producer's I/O thread, when
         # the broker responds (or the send ultimately fails). on_error is bound
         # to this record via partial so the errback knows WHICH message failed.
-        get_producer().send(topic_name, key=key, value=value) \
+        get_producer().send(topic_name, key=key, value=value, headers=headers) \
             .add_callback(on_success) \
             .add_errback(partial(on_error, topic_name, key, value))
     except KafkaTimeoutError as exc:
-        # buffer full -> back-pressure signal. Don't drop silently; record it.
+        # buffer full -> back-pressure signal. Don't drop silently; dead-letter.
         print(f"Buffer full, send blocked -> key: {key}  error: {exc}")
-        dead_letters.append((topic_name, key, value, exc))
+        send_to_dead_letter(topic_name, key, value, exc, source="producer")
     except KafkaError as exc:
         # serialization error, producer closed, etc. -> caller's thread.
         print(f"send() failed synchronously -> key: {key}  error: {exc}")
-        dead_letters.append((topic_name, key, value, exc))
+        send_to_dead_letter(topic_name, key, value, exc, source="producer")
 
 
 def flush_producer():

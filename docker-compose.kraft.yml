@@ -80,5 +80,47 @@ services:
       # let Conduktor browse/validate schemas
       CDK_CLUSTERS_0_SCHEMAREGISTRY_URL: "http://schema-registry:8081"
 
+  # --- OpenSearch: sink for the Kafka consumer (Wikimedia -> OpenSearch) ---
+  opensearch:
+    image: opensearchproject/opensearch:2.13.0
+    container_name: opensearch
+    environment:
+      # single node -> no cluster discovery needed for local dev
+      discovery.type: single-node
+      # turn OFF the security plugin so the REST API is plain HTTP with no auth
+      # (fine for local dev; the consumer can hit http://localhost:8060 directly)
+      DISABLE_SECURITY_PLUGIN: "true"
+      # keep the JVM heap small so it fits comfortably on a laptop
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ulimits:
+      # OpenSearch requires memory lock and a high mmap count
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      # REST API on http://localhost:8060 (container's 9200)
+      - "8060:9200"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+
+  # --- OpenSearch Dashboards: UI for browsing the indexed documents ---
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.13.0
+    container_name: opensearch-dashboards
+    depends_on:
+      - opensearch
+    environment:
+      # reach OpenSearch over the INTERNAL network (not the host port)
+      OPENSEARCH_HOSTS: '["http://opensearch:9200"]'
+      # security plugin is disabled on the server, so disable it here too
+      DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true"
+    ports:
+      # Dashboards UI on http://localhost:8061 (container's 5601)
+      - "8061:5601"
+
 volumes:
   pg_data:
+  opensearch_data:

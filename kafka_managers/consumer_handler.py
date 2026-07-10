@@ -1,6 +1,20 @@
 from abc import ABC, abstractmethod
 
 
+class PoisonMessage(Exception):
+    """Raised by a handler when a record can NEVER be processed successfully
+    (bad/corrupt data, missing required fields, ...).
+
+    It tells run_consumer: do NOT retry this record -> retrying a poison message
+    would block the partition forever. Instead the loop logs/dead-letters it and
+    commits PAST it so the consumer keeps making progress.
+
+    Any OTHER exception a handler raises is treated as TRANSIENT (e.g. the sink
+    is temporarily down): run_consumer does NOT commit, seeks back, and re-reads
+    the record until it succeeds.
+    """
+
+
 class ConsumerHandler(ABC):
     """Abstract per-record handler.
 
